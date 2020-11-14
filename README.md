@@ -1,0 +1,2 @@
+# vomiting_outbreak_uk_dogs
+In early 2020, the Small Animal Veterinary Surveillance Network reported evidence of an outbreak of acute prolific vomiting in dogs in the UK. The aims of this study were to investigate whether there was evidence for a vomiting outbreak in Dogslife and Google Trends data and to describe its characteristics. The code here is what we used in statistical analysis of the data we collected.
