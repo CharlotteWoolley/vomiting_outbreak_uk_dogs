@@ -1,0 +1,1322 @@
+---
+title: "Vomiting outbreak in dogs 2020 analysis"
+author: "Charlotte Woolley"
+output: html_document
+Date: "9th of November 2020"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+Description: This script performs the statistical analysis for vomiting outbreak in dogs in the UK, using data collected from Google Trends and Dogslife
+
+*Libraries needed for this analysis*
+
+```{r}
+library(MASS)
+library(gtrendsR)
+library(lubridate)
+library(epiR)
+library(caret)
+library(corrplot)
+library(broom)
+library(logistf)
+library(Rmisc)
+library(ggpubr)
+library(ggthemes)
+library(forestplot)
+library(tidyverse)
+options(scipen = 999)
+```
+
+
+# Collection, data cleaning and processing of Dogslife data
+
+```{r}
+  illness_filt <- read_csv("dogslife_cleaned_for_vomiting_analysis.csv", guess_max = 100000) %>%
+    filter(date_of_data_entry < as.Date("2020-04-01")) %>% #filter the dates of data to relevant ones
+    filter(date_of_data_entry >= as.Date("2010-12-01")) %>%
+    mutate(month = floor_date(date_of_data_entry, "month"), #convert dates to months
+           start_month = floor_date(start_date, "month"),
+           reporting_time = as.numeric(difftime(date_of_data_entry, start_date, units = "days")),
+           month_no = month(month),
+           year_no = year(month),
+           start_month_no = month(start_month)) 
+
+seasons_dat <- illness_filt %>%
+    select(month,month_no,year_no) %>%
+    distinct() %>%
+    filter(month_no > 11 | #filter the months of data to relevant ones
+             month_no < 4) %>%
+    arrange(month)
+  seasons_dat$season_no <- sort(rep(1:10,4)) #give the seasons numbers
+  
+ illness_filt2 <- illness_filt %>%
+    full_join(seasons_dat) %>%
+    mutate(age = as.numeric(abs(difftime(DOB, date_of_data_entry)))/365, #convert age to years
+           age_cat = case_when(age < 1 ~'under 1', #split age into catgories to be used
+                               age >= 1 & age < 3.5 ~ '1 to 3.5',
+                               age >= 3.5 & age < 7 ~ '3.5 to 7',
+                               age >= 7 & age < 10.5 ~ '7 to 10.5',
+                               TRUE ~ "Unknown"),
+           season = case_when(season_no == 10 ~ "This season", #allow filtering of data by season
+                              TRUE ~ "Previous seasons")) %>%
+    filter(month_no > 11 | #REMOVE MONTHS NOT OF INTEREST
+             month_no < 4) %>%
+   group_by(pet_ID, season) %>%
+  mutate(any_vom = any(episode == "yes", na.rm = TRUE)) %>%
+        ungroup() 
+ 
+ risk_dat <- illness_filt2 %>% #REMOVE START DATES THAT PRECEDED REPORT DATES AT THIS POINT
+    filter(start_month_no > 11 | 
+             start_month_no < 4 |
+             is.na(start_month_no)) 
+ 
+ #split the data into subsets to allow for data summaries below
+ illness_filt3 <- illness_filt2 %>%
+   filter(episode == "yes") 
+ 
+ illness_filt4 <- illness_filt3 %>%
+   filter(start_month_no > 11 | 
+             start_month_no < 4 |
+             is.na(start_month_no)) %>%
+  filter(!is.na(start_date))
+ 
+ this_seas <- risk_dat %>%
+  filter(season == "This season")
+
+ prev_seas <- risk_dat %>%
+  filter(season == "Previous seasons")
+ 
+ incidence_reports <- illness_filt %>%
+  group_by(month) %>%
+  count(vomiting_episode = episode == "yes") %>%
+  spread(., vomiting_episode, n) %>%
+  rename(vom_TRUE = `TRUE`,
+         vom_FALSE = `FALSE`) %>%
+  ungroup() %>%
+  mutate(reporting_incidence = (vom_TRUE/(vom_FALSE+vom_TRUE))*100) %>%
+  mutate(fake_col = TRUE)
+```
+
+
+Data for this study were collected during the first 10 years of Dogslife from December 2010 to March 2020, via routine online reporting. Dogslife data was cleaned sepearetly prior to analysis in this file. The total number of cleaned Dogslife reports during this time period was `r length(illness_filt$pet_ID)`.
+
+Of the vomiting reports recorded by owners in this subset, `r ((sum(!is.na(illness_filt3$start_date))/sum(!is.na(illness_filt3$date_of_data_entry)))*100)` had completed start dates. Start dates were used where available to remove vomiting episodes that preceded the month of December for each season, leading to the removal of `r (length(illness_filt2$pet_ID) - length(risk_dat$pet_ID))` vomiting reports. The time lag between start dates and reporting dates in the remaining data was `r CI(illness_filt4$reporting_time, ci = 0.95)` with an SD of `r sd(illness_filt4$reporting_time)` days. 
+
+Summary statistics of Dogslife data in the season of interest (December 2019 to March 2020) and previous seasons (December to March in the years 2010 to 2019).
+
+This season:
+The number of reports is `r length(this_seas$pet_ID)`
+
+```{r, echo=TRUE}
+#The age of dogs 
+as.data.frame(table(this_seas$age_cat)) %>%
+  mutate(perc = (Freq/sum(Freq))*100)
+#The sex of dogs were
+as.data.frame(table(this_seas$sex)) %>%
+  mutate(perc = (Freq/sum(Freq))*100)
+
+```
+
+
+Prev season:
+The number of reports is `r length(prev_seas$pet_ID)`
+
+```{r}
+#The age of dogs were 
+as.data.frame(table(prev_seas$age_cat)) %>%
+  mutate(perc = (Freq/sum(Freq))*100)
+
+#The sex of dogs were 
+as.data.frame(table(prev_seas$sex)) %>%
+  mutate(perc = (Freq/sum(Freq))*100)
+
+```
+
+
+# Confirmation and comparison of the peak in Dogslife vomiting incidence and Google Trends search index between December 2019 and March 2020 to previous seasons
+
+### GOOGLE TRENDS DATA ANALYSIS FOR IDENTIFYING VOMITING OUTBREAK
+Google trends data scraped on 27th May, 28th and 29th May for 'puppy vomiting' and 'dog vomiting' 
+was gathered prior to the following analysis, and saved into 6 objects called 'dog1', 'pup1', 
+'dog2', 'pup2', 'dog3', 'pup4'. An example of how this was carried out, using today's data is given below.
+
+```{r}
+g_example <- gtrends("dog vomiting",
+                       geo = "GB",
+                       time = "2010-01-01 2020-04-30")
+#objects were saved in rds format
+
+#data from 27th May
+dog1 <- read_rds("gt_data/dog_results_yearly_27_05_2020")$interest_over_time
+pup1 <- read_rds("gt_data/pup_results_yearly_27_05_2020")$interest_over_time
+#Data from 28th May
+dog2 <- read_rds("gt_data/dog_results_yearly_28_05_2020")$interest_over_time
+pup2 <- read_rds("gt_data/pup_results_yearly_28_05_2020")$interest_over_time
+#Data from 29th May
+dog3 <- read_rds("gt_data/dog_results_yearly_29_05_2020")$interest_over_time
+pup3 <- read_rds("gt_data/pup_results_yearly_29_05_2020")$interest_over_time
+
+
+  trends_dat_unfilt <- rbind(dog1, pup1, dog2, pup2, dog3, pup3) %>% #join the data
+    group_by(date) %>%
+    summarise(hits = mean(hits))  %>% #Take the mean of the 3 data scrapes
+    filter(date < as.Date("2020-04-01")) %>% #filter the dates of data to relevant ones
+    filter(date >= as.Date("2010-12-01")) %>%
+    mutate(date = as.Date(date)) %>% #reformat date
+    mutate(puppy_dog_vom = (hits/max(hits))*100) %>% #renormalise the data so maximum is 100
+    select(-hits) %>%
+    mutate(lm_detrend_puppy_dog_vom = residuals(lm(puppy_dog_vom ~ date))) %>% #find the linear trend over time
+    mutate(month_no = month(date)) %>%
+    ungroup()
+  
+  trends_dat <- trends_dat_unfilt %>%
+    filter(month_no > 11 | #filter the months of data to relevant ones
+             month_no < 4) %>%
+    arrange(date)
+
+#give the seasons numbers and split the data into the 
+#current season for this year (2019/2020) and previous years (2010-2019)
+  trends_dat$season_no <- sort(rep(1:10,4)) 
+  trends_dat <- trends_dat %>%
+    mutate(season = case_when(season_no != 10 ~ "Previous seasons",
+                              TRUE ~ "This season"))
+  trends_PS <- trends_dat %>% filter(season_no != 10)
+  trends_TS <- trends_dat %>% filter(season_no == 10)
+
+#Take the mean across months for each season
+  trends_PS2 <- trends_PS %>% 
+    group_by(season_no) %>%
+    summarise(puppy_dog_vom = mean(puppy_dog_vom),
+              lm_detrend_puppy_dog_vom = mean(lm_detrend_puppy_dog_vom))
+  
+  trends_TS2 <- trends_TS %>% 
+    group_by(season_no) %>%
+    summarise(puppy_dog_vom = mean(puppy_dog_vom),
+              lm_detrend_puppy_dog_vom = mean(lm_detrend_puppy_dog_vom))
+
+#ORIGINAL Data (without linear trend removed)
+# A normal distribution  was fitted by maximum 
+#likelihood using the fitdistr function in the ‘MASS’ package. 
+
+  dist1 <- MASS::fitdistr(trends_PS2$puppy_dog_vom, densfun = "normal")
+
+#A one-tailed statistical test was 
+#defined, which estimates the probability of observing the value of the current season of 
+#interest (December 2019 to March 2020) value or greater under the null distribution based 
+#on the combined Google Trends search index means in previous seasons, using the pnorm function
+  r1 <- pnorm(as.numeric(trends_TS2[2]), mean = as.numeric(dist1$estimate[1]), sd = as.numeric(dist1$estimate[2]))
+
+# DETRENDED Dog and puppy vomiting data
+  dist2 <- MASS::fitdistr(trends_PS2$lm_detrend_puppy_dog_vom, densfun = "normal")
+  r2 <- pnorm(as.numeric(trends_TS2[3]), mean = as.numeric(dist2$estimate[1]), sd = as.numeric(dist2$estimate[2]))
+```
+
+A normal distribution of the original combined Google Trends search index means of previous seasons (December to March, 2010 to 2019) was fitted based on the mean and standard deviation `r dist1$estimate` of the data and compared to the combined Google Trends search index mean `r as.numeric(trends_TS2[2])` of the current season of interest (December 2019 to March 2020).  The peak original Google Trends search index was reached in `r (trends_TS %>% filter(puppy_dog_vom == max(puppy_dog_vom)) %>% pull(date))` at `r (trends_TS %>% filter(puppy_dog_vom == max(puppy_dog_vom)) %>% pull(puppy_dog_vom))`. The Google Trends search index mean of the current season of interest was significantly greater `r 1-r1` than the Google Trends search index means computed from previous seasons. A normal distribution of the detrended combined Google Trends search index means of previous seasons (December to March, 2010 to 2019) was fitted based on the mean and standard deviation `r dist2$estimate` of the data and compared to the combined Google Trends search index mean `r as.numeric(trends_TS2[3])` of the current season of interest (December 2019 to March 2020).  The peak detrended Google Trends search index was reached in `r (trends_TS %>% filter(lm_detrend_puppy_dog_vom == max(lm_detrend_puppy_dog_vom)) %>% pull(date))` at `r (trends_TS %>% filter(lm_detrend_puppy_dog_vom == max(lm_detrend_puppy_dog_vom)) %>% pull(lm_detrend_puppy_dog_vom))`. The Google Trends search index mean of the current season of interest was significantly greater `r 1-r2` than the Google Trends search index means computed from previous seasons. 
+
+### DOGSLIFE DATA ANALYSIS FOR IDENTIFYING VOMITING OUTBREAK AND COMPARING TO PREVIOUS SEASONS
+```{r}
+  #reformat some variables
+  risk_dat$episode <- factor(risk_dat$episode, levels = c("yes", "no"))
+  risk_dat$season <- factor(risk_dat$season, levels = c("This season","Previous seasons"))
+  risk_dat$age_cat <- factor(risk_dat$age_cat,  levels = c('under 1','1 to 3.5','3.5 to 7', '7 to 10.5'))
+  
+  ## This winter's vomiting INCIDENCE peak in comparison to the same dates on previous years, statisfied by age
+  #put data into frequency table
+  strat_table1 <- table(risk_dat$episode, risk_dat$season, risk_dat$age_cat)
+  #run adjusted chi-squared by age
+  risk_epi <- epi.2by2(dat = strat_table1, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  ## This winter's vomiting vet visits, vomiting duration and vomiting frequency in comparison to the same dates on previous years
+  vom_dat <- risk_dat %>% 
+    filter(episode == "yes") 
+  
+  #reformatting data
+  vom_dat$time_to_see_vet <- factor(vom_dat$time_to_see_vet, levels = c("vet quickly seen", "vet not quickly seen"))
+  vom_dat$vet_visit <- factor(vom_dat$vet_visit, levels = c(TRUE, FALSE))
+  vom_dat$freq <- factor(vom_dat$freq, levels = c("Prolific", "Not prolific"))
+  vom_dat$duration <- factor(vom_dat$duration, levels = c("long episode", "short episode"))
+  
+  #Vet visit frequency Mantel-Haenszel
+  strat_table2 <- table(vom_dat$vet_visit, vom_dat$season, vom_dat$age_cat)
+  vet_visit_epi <- epi.2by2(dat = strat_table2, method = "cohort.count", 
+                            conf.level = 0.95, outcome = "as.columns")
+  
+  #Vom frequency
+  strat_table4 <- table(vom_dat$freq, vom_dat$season, vom_dat$age_cat)
+  vom_freq_epi <- epi.2by2(dat = strat_table4, method = "cohort.count", 
+                           conf.level = 0.95, outcome = "as.columns")
+  
+  #vom_duration
+  strat_table5 <- table(vom_dat$duration, vom_dat$season, vom_dat$age_cat)
+  vom_duration_epi <- epi.2by2(dat = strat_table5, method = "cohort.count", 
+                               conf.level = 0.95, outcome = "as.columns")
+```
+
+In the current season of interest (December 2019 to March 2020), `r sum(this_seas$episode == "yes")` 
+(`r (sum(this_seas$episode == "yes")/length(this_seas$pet_ID))*100`%) of Dogslife reports involved a vomiting episode, while `r sum(this_seas$episode == "no")` 
+(`r (sum(this_seas$episode == "no")/length(this_seas$pet_ID))*100`%) did not. In previous seasons (December to March, 2010 to 2019) `r sum(prev_seas$episode == "yes")` 
+(`r (sum(prev_seas$episode == "yes")/length(prev_seas$pet_ID))*100`%) of Dogslife reports involved a vomiting episode, while `r sum(prev_seas$episode == "no")` 
+(`r (sum(prev_seas$episode == "no")/length(prev_seas$pet_ID))*100`%) did not. 
+
+The peak vomiting incidence in Dogslife data was reached in `r (incidence_reports %>% filter(reporting_incidence == max(reporting_incidence)) %>% pull(month))` at `r incidence_reports %>% filter(reporting_incidence == max(reporting_incidence)) %>% pull(reporting_incidence)`. 
+
+Incidence of vomiting episodes
+crude: `r risk_epi$massoc$OR.crude.wald`
+
+adjusted: `r risk_epi$massoc$OR.mh.wald`
+
+Proportion of vomiting episodes that led to a veterinary visit
+crude: `r vet_visit_epi$massoc$OR.crude.wald`
+
+adjusted: `r vet_visit_epi$massoc$OR.mh.wald`
+
+Proportion of vomiting episodes that were prolific (where vomiting occurred more than five times a day)
+crude: `r vom_freq_epi$massoc$OR.crude.wald`
+
+adjusted: `r vom_freq_epi$massoc$OR.mh.wald`
+
+Proportion of vomiting episodes that had a long duration (where symptoms lasted longer than 48 hours)
+crude: `r vom_duration_epi$massoc$OR.crude.wald`
+
+adjusted: `r vom_duration_epi$massoc$OR.mh.wald`
+
+### PLOT RESULTS FOR THIS SECTION
+```{r}
+trends_plot <- trends_dat_unfilt %>%
+  select(date, puppy_dog_vom, lm_detrend_puppy_dog_vom) %>%
+  gather(., "type", "hits", puppy_dog_vom, lm_detrend_puppy_dog_vom)
+
+gt_plot2 <- ggplot(trends_plot, aes(x = date, y = hits, colour = type)) +  
+  geom_line() +
+  labs(x = "Date", y = "Google Search Index") +
+  scale_x_date(breaks = c(seq.Date(as.Date("2010-01-01"), as.Date("2021-01-01"), by = "year")), labels = c(as.character(seq(2010, 2021, by = 1)))) +
+  scale_color_manual(values = c("#E6AB02","#7570B3"), labels = c("Detrended data", "Original data")) +
+  scale_y_continuous(limits = c(-20,100)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14), 
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        legend.title = element_blank(), 
+        legend.text = element_text(face="bold", size=14),
+        legend.position = "top") +
+    geom_vline(xintercept = as.Date("2020-03-01")) +
+  geom_vline(xintercept = as.Date("2019-12-01")) +
+  geom_vline(xintercept = as.Date("2019-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2018-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2018-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2017-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2017-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2016-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2016-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2015-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2015-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2014-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2014-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2013-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2013-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2012-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2012-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2011-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2011-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2010-12-01"), linetype = "longdash") 
+
+
+number_reports <- illness_filt %>%
+  mutate(month = floor_date(date_of_data_entry, "month")) %>%
+  filter(episode == "yes") %>%
+  group_by(month) %>%
+  count() %>%
+  mutate(type = "reports")
+
+number_starts <- illness_filt %>%
+  mutate(month = floor_date(start_date, "month")) %>%
+  filter(episode == "yes") %>%
+  filter(!is.na(start_date)) %>%
+  group_by(month) %>%
+  count() %>%
+  mutate(type = "starts")
+
+numbers_vom <- rbind(number_starts, number_reports) %>%
+  mutate(n = as.numeric(n))
+
+plot_vom <- ggplot(numbers_vom, aes(x = month, y = n)) + 
+  geom_line(aes(group = type, colour = type)) +
+    labs(x = "Date", y = "Dogslife vomiting episodes") +
+  scale_color_manual(values = c("#1B9E77", "#D95F02"), labels = c("Vomiting Reports", "Vomiting Start Dates")) +
+  scale_x_date(breaks = c(seq.Date(as.Date("2010-01-01"), as.Date("2021-01-01"), by = "year")), labels = c(as.character(seq(2010, 2021, by = 1)))) +
+  scale_y_continuous(limits = c(0,70)) +
+  theme_bw() +
+   theme(axis.title.y = element_text(face="bold", size=14), 
+                      axis.text.y  = element_text(size=14),
+                      axis.title.x = element_text(face="bold", size=14),
+                      axis.text.x  = element_text(size=14),
+                      legend.title = element_blank(), 
+                      legend.text = element_text(face="bold", size=14),
+                      legend.position = "top")
+
+inc2 <- ggplot(incidence_reports, aes(x = month, y = reporting_incidence, colour = fake_col)) +  
+  geom_line() +
+  labs(x = "Date", y = "Dogslife vomiting incidence") +
+  scale_x_date(breaks = c(seq.Date(as.Date("2010-01-01"), as.Date("2021-01-01"), by = "year")), labels = c(as.character(seq(2010, 2021, by = 1)))) +
+    scale_color_manual(values = c("#1B9E77","#1B9E77"), labels = c(" ", " ")) +
+  scale_y_continuous(limits = c(0,15)) +
+  theme_bw() +
+  guides(colour = FALSE) +
+  theme(axis.title.y = element_text(face="bold", size=14), 
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        legend.title = element_blank(), 
+        legend.text = element_text(face="bold", size=14),
+        legend.position = "top") +
+  theme(plot.margin = unit(c(1,0,0,0), "cm")) +
+  geom_vline(xintercept = as.Date("2020-03-01")) +
+  geom_vline(xintercept = as.Date("2019-12-01")) +
+  geom_vline(xintercept = as.Date("2019-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2018-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2018-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2017-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2017-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2016-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2016-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2015-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2015-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2014-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2014-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2013-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2013-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2012-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2012-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2011-12-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2011-03-01"), linetype = "longdash") +
+  geom_vline(xintercept = as.Date("2010-12-01"), linetype = "longdash") 
+  
+paper1 <- ggarrange(plot_vom, inc2, gt_plot2,
+                    labels = c("a", "b", "c"),
+                    ncol = 1, nrow = 3,
+                    hjust = c(-3, -3, -3),
+                    vjust = c(2, 1, 2),
+                    align = "v")
+paper1
+
+ggsave(filename = "Figure1.tiff",
+       plot = paper1,
+       width = 400, height = 220, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+
+pdat <- full_join(trends_PS2, trends_TS2)
+
+set.seed(809)
+q1a <- ggplot() +  
+  geom_point(pdat, mapping = aes(x = puppy_dog_vom, y = 0), alpha = 0.5, size = 3) +
+  labs(x = "Original Google Trends search index means", y = " ") +
+  scale_x_continuous(limits = c(0, 100)) +
+  geom_vline(xintercept = as.numeric(trends_TS2[2]), linetype = "longdash", colour = "red2") +
+  geom_density(mapping = aes(rnorm(1000000, as.numeric(dist1$estimate[1]),  as.numeric(dist1$estimate[2])))) +
+  theme_bw() +
+  theme(axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+set.seed(809)
+q2a <- ggplot() +  
+  geom_point(pdat, mapping = aes(x = lm_detrend_puppy_dog_vom, y = 0), alpha = 0.5, size = 3) +
+  labs(x = "Detrended Google Trends search index means", y = " ") +
+  scale_x_continuous(limits = c(-20, 20)) +
+  geom_vline(xintercept = as.numeric(trends_TS2[3]), linetype = "longdash", colour = "red2") +
+  geom_density(mapping = aes(rnorm(1000000, as.numeric(dist2$estimate[1]),  as.numeric(dist2$estimate[2])))) +
+  theme_bw() +
+  theme(axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+#Make a plot that joins these graphs together
+paper2 <- ggarrange(q1a, q2a,
+                   labels = c(" ", " "),
+                   ncol = 2, nrow = 1,
+                   align = "v")
+paper2
+
+ggsave(filename = "Figure2.tiff",
+       plot = paper2,
+       width = 200, height = 150, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+```
+
+
+# Description and analysis of the presentation of vomiting in Dogslife reports between December 2019 and March 2020
+
+```{r}
+  vom_dat2 <- vom_dat %>%
+    filter(season == "This season") 
+
+dia_counts <-vom_dat2 %>%
+  count(suspected_cause) %>%
+  mutate(perc_n = (n/length(vom_dat2$pet_ID))*100) %>% 
+  arrange(perc_n)
+
+treat_counts <- vom_dat2 %>%
+  filter(vet_visit == TRUE) %>%
+  select(antisickness_treat:no_treat) %>%
+  summarise_all(list(n = sum)) %>%
+  gather(., key = "treatment_type", value = "n") %>%
+  mutate(perc_n = (n/44)*100) %>% 
+  arrange(perc_n)
+
+vv_data <- vom_dat %>%
+  count(season, vet_visit) %>%
+  group_by(season) %>%
+  mutate(perc_n = (n/sum(n))*100) %>%
+ungroup()
+
+vf_data <- vom_dat %>%
+  count(season, freq) %>%
+  group_by(season) %>%
+  mutate(perc_n = (n/sum(n))*100) %>%
+  mutate(freq = factor(case_when(is.na(freq) ~ "No Data",
+                          TRUE ~ as.character(freq))))
+
+vd_data <- vom_dat %>%
+  count(season, duration) %>%
+  group_by(season) %>%
+  mutate(perc_n = (n/sum(n))*100)  %>%
+  mutate(duration = factor(case_when(is.na(duration) ~ "No Data",
+                          TRUE ~ as.character(duration))))
+```  
+
+Suspected cause numbers and percentages
+```{r, echo=TRUE}
+dia_counts
+```
+`r dia_counts$perc_n`
+
+Treatments numbers and percentages
+```{r, echo=TRUE}
+treat_counts
+```
+`r treat_counts$perc_n`
+
+Veterinary visit numbers and percentages
+```{r, echo=TRUE}
+vv_data
+```
+`r vv_data$perc_n`
+
+Vomiting frequency numbers and percentages
+```{r, echo=TRUE}
+vf_data
+```
+`r vf_data$perc_n`
+
+Vomiting duration numbers and percentages
+```{r, echo=TRUE}
+vd_data
+```
+`r vd_data$perc_n`
+
+### PLOT GRAPHS FOR THIS SECTION
+```{r}
+UK <- map_data(map = "world", region = "UK") 
+
+map_plot <- ggplot() + 
+        geom_polygon(data = UK, aes(x = long, y = lat, group = group)) +
+        coord_map() + 
+        geom_point(data= this_seas, aes(x =pcode_longitude, y=pcode_latitute, group = episode, colour = any_vom), alpha = 0.7,size = 0.6) +
+  labs(x = "", y = "") +
+  theme_map() +
+  scale_colour_manual(values = c("#7570B3","#E6AB02"), labels = c("No vomiting", "Vomiting")) +
+  theme(axis.title.y = element_blank(),  
+        axis.text.y  = element_blank(), 
+        axis.title.x =element_blank(), 
+        axis.text.x  = element_blank(), 
+        legend.title = element_blank(), 
+        legend.text = element_text(face="bold", size=12),
+        legend.position = c(0.7, 0.5)) +
+  guides(color = guide_legend(override.aes = list(size=2)))
+map_plot
+
+ggsave(filename = "Figure3.tiff",
+       plot = map_plot,
+       width = 100, height = 130, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+
+dia_counts_p <-vom_dat2 %>%
+  count(suspected_cause, vet_visit) %>%
+  mutate(perc_n = (n/length(vom_dat2$pet_ID))*100)
+
+dia_counts_p$suspected_cause <- factor(dia_counts_p$suspected_cause, levels = c(
+  "Environmental or dietary reasons","other health reason","unknown","Something dog ate","Virus or bug"))
+
+plot_dia <- ggplot(dia_counts_p, aes(x = suspected_cause, y = perc_n, fill = vet_visit)) +
+  geom_bar(stat = "identity") +
+  labs(x = "", y = "Percentage of vomiting episodes") +
+  scale_fill_manual(values = c("#762A83", "#1B7837"), labels = c("Veterinary diagnosis", "Owner reason for illness")) +
+  scale_x_discrete(labels = c("Environmental","Illness Complication","Unknown","Scavenging","'Virus' or 'bug'")) +
+  theme_bw() +
+  scale_y_continuous(breaks = c(seq(0,40,5))) +
+  coord_flip() +
+  theme(axis.title.x = element_text(face="bold", size=14), 
+        axis.text.x  = element_text(size=14),
+        axis.text.y  = element_text(face="bold",size=14),
+        legend.title = element_blank(), 
+        legend.text = element_text(face="bold", size=14),
+        legend.position = "top")
+
+plot_treat <- ggplot(treat_counts, aes(x = reorder(treatment_type, perc_n), y = perc_n)) +
+  geom_bar(stat = "identity", fill = "#762A83") +
+  labs(x = "", y = "Percentage of vomiting episodes with vet visit") +
+  scale_x_discrete(labels = c("Steroids","Other","No Treatment","Unknown Treatment","Fluids", "Pain Relief", "Diet Change", "Antibiotics", "Probiotics", "GI Protectors", "Anti-emetics")) +
+  theme_bw() +
+  scale_y_continuous(breaks = c(seq(0,60,10))) +
+  coord_flip() +
+  theme(plot.margin = unit(c(1,0,0,0), "cm")) +
+  theme(axis.title.x = element_text(face="bold", size=14), 
+        axis.text.x  = element_text(size=14),
+        axis.text.y  = element_text(face="bold",size=14)) 
+
+paper4 <- ggarrange(plot_dia, plot_treat,
+                    labels = c("a", "b"),
+                    ncol = 1, nrow = 2)
+paper4
+
+ggsave(filename = "Figure4.tiff",
+       plot = paper4,
+       width = 250, height = 180, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+
+
+vv_data$vet_visit <- factor(vv_data$vet_visit, levels = c(FALSE, TRUE))
+vf_data$freq <- factor(vf_data$freq, levels = c("No Data","Not prolific","Prolific"))
+vd_data$duration <- factor(vd_data$duration, levels = c("No Data","short episode", "long episode"))
+
+vv_data <- ggplot(vv_data, aes(x = season, y = perc_n, fill = vet_visit)) +
+  geom_bar(stat = "identity") +
+   labs(x = "", y = "Percentage of vomiting episodes") +
+  scale_fill_manual(values = c( "#1B7837","#762A83"), labels = c("No Vet Visit","Vet Visit")) +
+  scale_x_discrete(labels = c("Dec 2019 - Mar 2020", "Dec - Mar, 2011 - 2019")) +
+  theme_bw() +
+  scale_y_continuous(breaks = c(seq(0,100,10))) +
+   theme(axis.title.y = element_text(face="bold", size=12), 
+                      axis.text.y  = element_text(size=12),
+                      axis.text.x  = element_text(face="bold",size=12),
+                      legend.title = element_blank(), 
+                      legend.text = element_text(face="bold", size=12),
+                      legend.position = "top")
+
+vf_data <- ggplot(vf_data, aes(x = season, y = perc_n, fill = freq)) +
+  geom_bar(stat = "identity") +
+   labs(x = "", y = "Percentage of vomiting episodes") +
+  scale_fill_manual(values = c("grey60","#1B7837", "#762A83"), labels = c("No Data","Not Prolific", "Prolific")) +
+  scale_x_discrete(labels = c("Dec 2019 - Mar 2020", "Dec - Mar, 2011 - 2019")) +
+  theme_bw() +
+    scale_y_continuous(breaks = c(seq(0,100,10))) +
+   theme(axis.title.y = element_text(face="bold", size=12), 
+                      axis.text.y  = element_text(size=12),
+                      axis.text.x  = element_text(face="bold",size=12),
+                      legend.title = element_blank(), 
+                      legend.text = element_text(face="bold", size=12),
+                      legend.position = "top")
+
+vd_data <- ggplot(vd_data, aes(x = season, y = perc_n, fill = duration)) +
+  geom_bar(stat = "identity")  +
+   labs(x = "", y = "Percentage of vomiting episodes") +
+  scale_fill_manual(values = c("grey60", "#1B7837", "#762A83"), labels = c("No Data", "Short Epsiode", "Long Episode")) +
+  scale_x_discrete(labels = c("Dec 2019 - Mar 2020", "Dec - Mar, 2011 - 2019")) +
+  theme_bw() +
+    scale_y_continuous(breaks = c(seq(0,100,10))) +
+   theme(axis.title.y = element_text(face="bold", size=12), 
+                      axis.text.y  = element_text(size=12),
+                      axis.text.x  = element_text(face="bold",size=12),
+                      legend.title = element_blank(), 
+                      legend.text = element_text(face="bold", size=12),
+                      legend.position = "top")
+
+paper5 <- ggarrange(vv_data, vf_data, vd_data,
+          labels = c("a", "b", "c"),
+          ncol = 3, nrow = 1)
+
+paper5
+
+  ggsave(filename = "Figure5.tiff",
+       plot = paper5,
+       width = 350, height = 150, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+```
+
+# Modelling the risks for dogs vomiting and factors influencing veterinary attendance in the Dogslife vomiting outbreak indicated between December 2019 and March 2020
+
+### Modelling factors influencing veterinary attendance
+
+```{r, results=FALSE, fig.show='hide'}  
+  vom_dat3a <- vom_dat2 %>%
+    select(pet_ID, owner_ID, age, vet_visit,  freq, duration, sex, colour, cats_household, dogs_household, insurance_status, dog_has_occupation, sleeps_with_human,  bathed_since_last_visit, anti_parasitic_since_last_visit, household_type, household_smoking_status,  neuter_status, vet_reg_status, sleeps_with_pet, vacc_status,worm_status, neutering_status,hist_of_vom, area_class, UK_region) %>%
+    mutate_at(vars(freq, duration, sex, colour, vet_reg_status, cats_household, dogs_household,  insurance_status, dog_has_occupation, sleeps_with_human, sleeps_with_pet, bathed_since_last_visit, neuter_status, anti_parasitic_since_last_visit, household_type, household_smoking_status, vacc_status,worm_status, neutering_status,hist_of_vom, area_class, UK_region, neuter_status, vet_reg_status, sleeps_with_pet), as.factor) 
+  
+  vom_dat3b <- vom_dat3a %>%
+    drop_na() 
+  
+  #Have a look at duplicates
+vom_dups1 <- vom_dat3b %>%
+  mutate(dup_ent = duplicated(owner_ID) | duplicated(owner_ID, fromLast = TRUE)) %>%
+  filter(dup_ent == TRUE)
+  
+#randomly pick one episode from each owner where there are repeats (10 owners)
+  set.seed(433)
+  vom_dat3b <- vom_dat3b %>%
+    group_by(owner_ID) %>% 
+    sample_n(1) %>%
+    ungroup() %>%
+    select(-owner_ID)
+  
+  # one-hot encode dummy data
+  dummy_vom <- data.frame(predict(dummyVars(~., vom_dat3b), vom_dat3b))
+  par(mar=c(0.1,0.1,0.1,0.1))
+  co_matrix <- cor(dummy_vom)
+  c1 <- corrplot(co_matrix, type = 'lower', sig.level = 0.05)
+  #Need to drop vet reg status, neuter status and sleeps with pet from model! (This does not
+  #increase the data we can use so we do not need to reselect/subset variables)
+  
+  vom_dat4 <- vom_dat3b %>%
+    select(-neuter_status, -vet_reg_status, -sleeps_with_pet) 
+```
+
+Preparation of the data for a vomiting veterinary attendance model
+
+To assess what factors influenced owner decision making when considering whether to take their dog to the veterinarian for a vomiting episode during the outbreak period, Dogslife vomiting reports between December 2019 and March 2020 `r length(vom_dat3a$pet_ID)` were considered for inclusion into a multivariate logistic regression model. Where owners submitted multiple vomiting reports, they were removed at random so that each owner had submitted one report during the outbreak period. 
+
+```{r, echo=TRUE}
+as.data.frame(table(vom_dups1$owner_ID, vom_dups1$pet_ID)) %>% filter(Freq == 1) %>% arrange(Var1)
+as.data.frame(table(vom_dups1$owner_ID, vom_dups1$pet_ID)) %>% filter(Freq == 2) %>% arrange(Var1)
+```
+
+In total, eight owners had two vomiting reports from one of their dogs and two owners had two vomiting reports from two of their dogs, leading to the removal of 10 data entries and two dogs. 
+
+`r (ncol(vom_dat3a)-3)` variables were initially considered for inclusion into this vomiting risk model, assessed for collinearity using one-hot dummy variable encoding and three variables (vet reg status, neuter status and sleeps with pet) with strong correlations (r > 0.05 or r < -0.05) were removed from inclusion into the model (see appendix table for details). 
+
+A total of `r (length(vom_dat3a$pet_ID) -  length(vom_dat3b$pet_ID))-10` vomiting reports were removed due to missingness in the remaining `r (ncol(vom_dat4)-2)` variables. Therefore, `r length(vom_dat4$pet_ID)` vomiting reports were included in the model dataset; `r sum(vom_dat4$vet_visit == TRUE)` dogs who attended the veterinarian and `r sum(vom_dat4$vet_visit == FALSE)` dogs that did not. 
+
+
+```{r, results=FALSE, fig.show='hide'}
+  vom_dat4$freq <- factor(vom_dat4$freq, levels = c("Not prolific", "Prolific"))
+  vom_dat4$duration <- factor(vom_dat4$duration, levels = c("short episode", "long episode"))
+  vom_dat4$colour <- factor(vom_dat4$colour, levels = c("yellow", "chocolate", "fox red", "black"))
+  vom_dat4$vet_visit <- as.logical(vom_dat4$vet_visit)
+  
+  vetmod1 <- glm(vet_visit ~ freq + duration + sex + age + neutering_status + household_smoking_status + cats_household + insurance_status + dogs_household + dog_has_occupation + household_type +  vacc_status + worm_status + hist_of_vom + area_class + UK_region + sleeps_with_human + bathed_since_last_visit + anti_parasitic_since_last_visit, data = vom_dat4, family = binomial(link = "logit"))
+  
+  summary(vetmod1)
+  
+  #Variable selection - stepwise
+  vetmod1AIC <- stepAIC(vetmod1)
+  #Influential variables = anti_parasitic_since_last_visit, age, dogs_household, frequency, duration, household_type, area_class, sleeps_with_human, smoking
+  
+   #univariate models
+  summary(glm(vet_visit ~ freq, data = vom_dat4, binomial(link = "logit")))  
+  summary(glm(vet_visit ~ duration, data = vom_dat4, binomial(link = "logit")))  #**
+  summary(glm(vet_visit ~ sex, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ age, data = vom_dat4, binomial(link = "logit"))) 
+  summary(glm(vet_visit ~ neutering_status, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ sleeps_with_human, data = vom_dat4, binomial(link = "logit")))  #**
+  summary(glm(vet_visit ~ vacc_status, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ worm_status, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ hist_of_vom, data = vom_dat4, binomial(link = "logit"))) 
+  summary(glm(vet_visit ~ neutering_status, data = vom_dat4, binomial(link = "logit"))) 
+  summary(glm(vet_visit ~ cats_household, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ dogs_household, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ insurance_status, data = vom_dat4, binomial(link = "logit")))  #**
+  summary(glm(vet_visit ~ household_type, data = vom_dat4, binomial(link = "logit")))  #**
+  summary(glm(vet_visit ~ area_class, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ UK_region, data = vom_dat4, binomial(link = "logit")))
+  summary(glm(vet_visit ~ dog_has_occupation, data = vom_dat4, binomial(link = "logit")))   
+  summary(glm(vet_visit ~ household_smoking_status, data = vom_dat4, binomial(link = "logit")))  #**
+  summary(glm(vet_visit ~ bathed_since_last_visit, data = vom_dat4, binomial(link = "logit"))) 
+  summary(glm(vet_visit ~ anti_parasitic_since_last_visit, data = vom_dat4, binomial(link = "logit"))) 
+  
+  #Influential variables = houshold type, smoking, insurance, sleeps with human, duration
+
+  #Final model is the vetmod chosen with stepAIC vairables
+  vm_final <- glm(vet_visit ~ freq + duration + household_smoking_status + dogs_household + anti_parasitic_since_last_visit +
+    household_type + area_class + sleeps_with_human + age + insurance_status, data = vom_dat4, binomial(link = "logit"))
+  summary(vm_final)
+
+  #odds ratios
+  exp(vm_final$coefficients)
+  #CIs
+  exp(confint(vm_final))
+
+   #CHECK FOR INFLUENTIAL OBSERVATIONS
+  #Note that, not all outliers are influential observations. 
+  #To check whether the data contains potential influential observations, the standardized residual error can
+  #be inspected. Data points with an absolute standardized residuals above 3 represent possible outliers and 
+  #may deserve closer attention.
+  
+  augment(vm_final) %>% 
+    filter(abs(.std.resid) > 3) #No values are influnetial - check again after model fitting
+  
+   #CHECK FOR COLINEARITY
+  #The VIF measures how much the variance of an estimated regression coefficient increases if your 
+  #predictors are correlated. More variation is bad news; we're looking for precise estimates. 
+  #If the variance of the coefficients increases, our model isn't going to be as reliable. 
+  #Values > 4 are concerning.
+  #If all terms in an unweighted linear model have 1 df, then the usual variance-inflation factors are calculated.
+  #If any terms in an unweighted linear model have more than 1 df, then generalized variance-inflation 
+  #factors (Fox and Monette, 1992) are calculated. These are interpretable as the inflation in size of 
+  #the confidence ellipse or ellipsoid for the coefficients of the term in comparison with what would be 
+  #obtained for orthogonal data. The generalized vifs are invariant with respect to the coding of the terms 
+  #in the model (as long as the subspace of the columns of the model matrix pertaining to each term is invariant). 
+  #To adjust for the dimension of the confidence ellipsoid, the function also prints GVIF^[1/(2*df)] where df 
+  #is the degrees of freedom associated with the term. Through a further generalization, the implementation here is 
+  #applicable as well to other sorts of models, in particular weighted linear models, generalized linear models, 
+  #and mixed-effects models.
+  
+  #check for colinearity and influential values/data points
+  vif1 <-car::vif(vm_final) 
+  
+  vif1 #no colinearity
+  
+  #CHECK FOR PERFECT SEPARATION
+  table(vom_dat4$vet_visit, vom_dat4$insurance_status) #there is perfect seperation
+  
+  #This model has perfect seperation. We need to use a different logistic model. logistf is the main function of the package. It fits a logistic regression model applying Firth's correction to the likelihood. The following generic methods are available for logistf's output object: print, summary, coef, vcov, confint, anova, extractAIC, add1, drop1, profile, terms, nobs. Furthermore, forward and backward functions perform convenient variable selection. Note that anova, extractAIC, add1, drop1, forward and backward are based on penalized likelihood ratios.
+  
+   vm_final2 <- logistf(vet_visit ~ freq + duration + household_smoking_status + dogs_household + anti_parasitic_since_last_visit +
+    household_type + area_class + sleeps_with_human + age + insurance_status, data = vom_dat4)
+  summary(vm_final2)
+
+  #odds ratios
+  exp(vm_final2$coefficients)
+  #CIs
+  exp(confint(vm_final2))
+  
+  #roc analysis of final model
+    vom_dat4$predictions <- vm_final2$predict
+
+  pROC_vet <- pROC::roc(vom_dat4$vet_visit, vom_dat4$predictions,
+      smoothed = TRUE,
+              # arguments for ci
+              ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+              # arguments for plot
+              plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+              print.auc=TRUE, show.thres=TRUE, percent = TRUE )
+```
+
+Model output from vet visit
+```{r, echo=TRUE}
+#P values:
+vm_final2$prob
+
+#Odds ratios:
+exp(vm_final2$coefficients)
+
+#Confidence intervals:
+exp(confint(vm_final2))
+
+#AUC:
+pROC_vet$auc
+pROC_vet$ci
+
+```
+
+### PLOT THE MODEL OUTPUT for risk factor for vomiting
+
+```{r}
+vet1 <- tibble(Variable = vm_final2$terms,
+               OR = exp(vm_final2$coefficients),
+               lower95ci = exp(vm_final2$ci.lower),
+               upper95ci = exp(vm_final2$ci.upper),
+               `Pr(>|Z|)` = vm_final2$prob) %>%
+  mutate_at(vars(OR, lower95ci, upper95ci, `Pr(>|Z|)`), ~ round(., 3)) %>%
+   mutate(`Pr(>|Z|)` = case_when(Variable == "household_typeMore than one Adult" ~ "0.080",
+                                 Variable == "durationlong episode" ~ "< 0.001",
+                                TRUE ~ as.character(`Pr(>|Z|)`))) %>%
+  arrange(Variable) %>%
+  filter(Variable != "(Intercept)")
+
+categories2 <- tibble(Variable2 = c("Age (Years)",
+                                    "Dog has been wormed in the last 9 months",
+                                    NA_character_,
+                                    "Area classification",
+                                    NA_character_,
+                                    NA_character_,
+                                    "Another dog in household",
+                                    NA_character_,
+                                    "Duration of vomiting",
+                                    NA_character_,
+                                    "Frequency of vomiting",
+                                    NA_character_,
+                                    "Household smoking status",
+                                    NA_character_,
+                                    "Household type",
+                                    NA_character_,
+                                    NA_character_,
+                                    NA_character_,
+                                    "Insurance status",
+                                    NA_character_,
+                                    "Dog sleeps in same room as a human",
+                                    NA_character_),
+                     Category = c(NA_character_,
+                                  "No",
+                                  "Yes",
+                                  "Rural",
+                                  "Suburban",
+                                  "Urban",
+                                  "No",
+                                  "Yes",
+                                  "Short episode (≤ 48 hours)",
+                                  "Long episode (> 48 hours)",
+                                  "Not prolific (≤ 5 episodes in 24 hours)",
+                                  "Prolific (> 5 episodes in 24 hours)",
+                                  "No smoking",
+                                  "Smoking",
+                                  "Family",
+                                  "More than one adult",
+                                  "Retired (Single or Couple)",
+                                  "Single adult",
+                                   "No",
+                                  "Yes",
+                                  "No",
+                                  "Yes"),
+                          Variable = c("age",
+                                  "anti_parasitic_since_last_visityes",
+                                  "anti_parasitic_since_last_visityes",
+                                  "area_classsuburban",
+                                  "area_classsuburban",
+                                  "area_classurban", 
+                                  "dogs_householdyes",
+                                  "dogs_householdyes",
+                                  "durationlong episode",
+                                  "durationlong episode",
+                                  "freqProlific",
+                                  "freqProlific",
+                                  "household_smoking_statusYes",
+                                  "household_smoking_statusYes",
+                                  "household_typeMore than one Adult",
+                                  "household_typeMore than one Adult",
+                                  "household_typeRetired (Single or Couple)",
+                                  "household_typeSingle Adult",
+                                  "insurance_statusyes",
+                                  "insurance_statusyes",
+                                  "sleeps_with_humanyes",
+                                  "sleeps_with_humanyes"))
+
+vet1 <- full_join(vet1, categories2) %>%
+  mutate_at(vars(lower95ci, upper95ci, OR), ~ case_when(Category == "No" |
+                                                                      Category == "Rural" |
+                                                                      Category == "Short episode (≤ 48 hours)" |
+                                                                      Category == "Not prolific (≤ 5 episodes in 24 hours)" |
+                                                                      Category == "No smoking" |
+                                                                      Category == "Family" ~ NA_real_,
+                                                                    TRUE ~ .))
+ 
+vet_text <- vet1 %>%
+  mutate_all(~ as.character(.)) %>%
+        mutate(lower95ci = paste(lower95ci, "000", ""),
+               lower95ci = substr(str_replace_all(lower95ci, " ", ""), start = 1, stop = 5),
+               upper95ci = paste(upper95ci, "000", ""),
+               upper95ci = substr(str_replace_all(upper95ci, " ", ""), start = 1, stop = 5),
+               OR = paste(OR, "000", ""),
+              OR = substr(str_replace_all(OR, " ", ""), start = 1, stop = 5)) %>%
+  select(Variable = Variable2, Category, OR, lower95ci, upper95ci, `Pr(>|Z|)`) %>%
+  mutate_at(vars(lower95ci, upper95ci, `Pr(>|Z|)`, OR), ~ case_when(Category == "No" |
+                                                                      Category == "Rural" |
+                                                                      Category == "Short episode (≤ 48 hours)" |
+                                                                      Category == "Not prolific (≤ 5 episodes in 24 hours)" |
+                                                                      Category == "No smoking" |
+                                                                      Category == "Family" ~ NA_character_,
+                                                                    TRUE ~ .))
+
+vettext_labels <- tibble(Variable = c("Variable"), 
+                      Category = c("Category"), 
+                      OR = c("Odds ratio"),
+                      lower95ci = c("Lower 95% CI"),
+                      upper95ci = c("Upper 95% CI"),
+                      `Pr(>|Z|)` = c("P-value"))
+
+vet_text <- rbind(vettext_labels, vet_text)
+
+vet_nums <- vet1 %>%
+  select(OR, lower95ci, upper95ci) %>%
+        mutate_all(as.numeric) %>%
+  mutate_at(vars(OR), ~ case_when(is.na(.) == TRUE ~ 0,
+                                  TRUE ~ .))
+
+vet_labels <- tibble(OR = c(NA), 
+                      lower95ci = c(NA), 
+                      upper95ci = c(NA))
+
+vet_nums <- rbind(vet_labels, vet_nums)
+
+#Plot and save the forestplot
+fplot2 <- forestplot(vet_text, 
+                         vet_nums,
+                         align = "c",
+                         boxsize = 0.2,
+                         graphwidth = unit(14, "cm"),
+                         new_page = TRUE,
+                         colgap = unit(4, "mm"),
+                         is.summary = c(TRUE, rep(FALSE, 22)),
+                         lwd.ci=1.5,
+                         lwd.zero = 1.5,
+                         ci.vertices = TRUE,
+                         zero = 1,
+                         graph.pos = 4,
+                         clip = c(0,20),
+                             txt_gp=fpTxtGp(label=gpar(cex=1.5),
+                                        ticks=gpar(cex=1.5),
+                                        xlab=gpar(cex=1.5)),
+                         hrzl_lines = list("2" = gpar(col="#444444"),
+                                           "24" = gpar(col="#444444")),
+                         col = fpColors(lines="blue", box="darkblue", zero = "red"))
+fplot2
+ggsave(filename = "Figure7.tiff",
+       plot = forestplot(vet_text, 
+                         vet_nums,
+                         align = "c",
+                         boxsize = 0.2,
+                         graphwidth = unit(14, "cm"),
+                         new_page = TRUE,
+                         colgap = unit(4, "mm"),
+                         is.summary = c(TRUE, rep(FALSE, 22)),
+                         lwd.ci=1.5,
+                         lwd.zero = 1.5,
+                         ci.vertices = TRUE,
+                         zero = 1,
+                         graph.pos = 4,
+                         clip = c(0,20),
+                             txt_gp=fpTxtGp(label=gpar(cex=1.5),
+                                        ticks=gpar(cex=1.5),
+                                        xlab=gpar(cex=1.5)),
+                         hrzl_lines = list("2" = gpar(col="#444444"),
+                                           "24" = gpar(col="#444444")),
+                         col = fpColors(lines="blue", box="darkblue", zero = "red")),
+       width = 600, height = 300, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+```
+
+### Modelling risks for dogs vomiting
+
+```{r, results=FALSE, fig.show='hide'}
+risk_dat2a <- risk_dat %>%
+  filter(season == "This season") %>%
+  select(pet_ID, owner_ID, pcode_longitude, pcode_latitute, age, episode, sex, colour, cats_household, dogs_household, insurance_status, vet_reg_status, dog_has_occupation, sleeps_with_human, sleeps_with_pet, bathed_since_last_visit, anti_parasitic_since_last_visit,travelled_abroad_since_last_visit, household_type, household_smoking_status, vacc_status,worm_status,neuter_status, neutering_status,hist_of_vom, area_class, UK_region, weight, food_quantity, exercise_quantity, feeding_frequency, 
+feeding_times, diet_wet_food, diet_raw_food, diet_dry_food, titbits) %>%
+  mutate_at(vars(episode, sex, colour, cats_household, dogs_household, insurance_status, vet_reg_status, dog_has_occupation, sleeps_with_human, sleeps_with_pet, bathed_since_last_visit, anti_parasitic_since_last_visit,travelled_abroad_since_last_visit, household_type, household_smoking_status, vacc_status,worm_status,neuter_status, neutering_status,hist_of_vom, area_class, UK_region, 
+feeding_times, diet_wet_food, diet_raw_food, diet_dry_food, titbits), as.factor) %>%
+  group_by(pet_ID) %>%
+  mutate(any_vom = any(episode == "yes", na.rm = TRUE)) %>%
+        ungroup() 
+
+risk_dat2b <- risk_dat2a %>%
+  drop_na() 
+ 
+
+  #Have a look at duplicates
+risk_dups1 <- risk_dat2b %>%
+  mutate(dup_ent = duplicated(owner_ID) | duplicated(owner_ID, fromLast = TRUE)) %>%
+  filter(dup_ent == TRUE)
+
+risk_dups2  <- risk_dups1 %>%
+  group_by(pet_ID) %>%
+  mutate(all_no = all(episode == "no"),
+         all_yes = all(episode == "yes"),
+         both = all_no == FALSE & all_yes == FALSE) %>%
+  select(pet_ID, all_no,all_yes, both) %>%
+  distinct()
+
+#randomly pick one episode from each pet where there are repeats,
+#where one vomiting event is randomly chosen if a dog ever vomits, and one non-vomiting
+#event is chosed if the dog never vomits
+
+set.seed(720)
+risk_voms <- risk_dat2b %>% 
+  filter(episode == "yes") %>%
+  group_by(pet_ID) %>% 
+  sample_n(1) %>%
+  ungroup()
+
+set.seed(295)
+risk_nots <- risk_dat2b %>% 
+  filter(episode == "no") %>%
+  filter(any_vom == FALSE) %>%
+  group_by(pet_ID) %>% 
+  sample_n(1) %>%
+  ungroup() 
+
+risk_dat3 <- full_join(risk_nots, risk_voms) 
+
+# one-hot encode dummy data
+dummy_vom <- data.frame(predict(dummyVars(~., risk_dat3), risk_dat3))
+par(mar=c(0.1,0.1,0.1,0.1))
+co_matrix <- cor(dummy_vom)
+c2 <- corrplot(co_matrix, type = 'lower', sig.level = 0.05)
+
+#Need to take out vet reg status, sleeps with pet, dry food, neuter status, feeding times
+#(This does not increase the data we can use so we do not need to reselect/subset variables)
+#significant correlations over 0.5 or under -0.5
+risk_dat3 <- risk_dat3 %>%
+  select(-sleeps_with_pet, -vet_reg_status, -neuter_status, -diet_dry_food, -feeding_times)
+
+```
+Preparation of the data for a vomiting risk factor model
+
+To assess the risk factors associated with an owner-reported vomiting episode during the outbreak period, all Dogslife reports between December 2019 and March 2020 `r length(risk_dat2a$pet_ID)` were considered for inclusion into a multivariate logistic regression model. Where owners submitted multiple Dogslife reports, they were removed at random so that each owner had submitted one report during the outbreak period. 
+
+
+In total, `r length(risk_dups2$pet_ID)` dogs had multiple reports, `r sum(risk_dups2$all_no)` of which had multiple non-vomiting reports, `r sum(risk_dups2$all_yes)` had multiple vomiting reports and `r sum(risk_dups2$both)` had a mixture of vomiting and non-vomiting reports. To avoid including the dog as a random effect in the model, only one vomiting report was included for each dog. Where dogs had a mixture of vomiting and non-vomiting reports, the vomiting reports were given priority over non-vomiting reports so that all dogs that had experienced a vomiting episode was classified as having done so. This led to the random removal of `r length(risk_dat3$pet_ID) - length(risk_dat2b$pet_ID)` reports from the dataset.
+     `r (ncol(risk_dat2b)-6)` variables were initially considered for inclusion into this vomiting risk model, assessed for collinearity using ‘one-hot’ dummy variable encoding and five variables (vet reg status, sleeps with pet, dry food, neuter status, feeding times) with strong correlations (r > 0.05 or r < -0.05) were removed from inclusion into the model (see appendix table for details). A total of `r length(risk_dat2a$pet_ID) -  length(risk_dat2b$pet_ID)` reports were removed due to missingness in the remaining 26 variables. Therefore, `r length(risk_dat3$pet_ID)` reports were included in the model dataset; `r sum(risk_dat3$any_vom == TRUE)` dogs who experienced a vomiting episode and `r sum(risk_dat3$any_vom == FALSE)` dogs that did not.
+
+```{r, results=FALSE, fig.show='hide'}
+risk_dat3$colour <- factor(risk_dat3$colour, levels = c("yellow", "chocolate", "fox red", "black"))
+risk_dat3$any_vom <- as.logical(risk_dat3$any_vom)
+risk_dat3$food_quantity <- risk_dat3$food_quantity/1000
+
+riskmod <- glm(any_vom ~ sex + colour + age + weight + household_smoking_status + insurance_status + cats_household + dogs_household + dog_has_occupation + household_type +  vacc_status + worm_status + hist_of_vom + neutering_status + area_class + UK_region + titbits + sleeps_with_human + food_quantity + feeding_frequency + exercise_quantity + diet_wet_food + diet_raw_food + bathed_since_last_visit + anti_parasitic_since_last_visit + travelled_abroad_since_last_visit, data = risk_dat3, family = binomial(link = "logit"))
+
+summary(riskmod)
+
+#Variable selection - stepwise
+  riskmodAIC <- stepAIC(riskmod)
+  summary(riskmodAIC)
+#influential variables are worm status, travelled_abroad_since_last_visit, titbits,  bathed_since_last_visit,
+#food_quantity, weight, insurance_status, hist_of_vom 
+  
+  #univariate models
+summary(glm(any_vom ~ sex, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ colour, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ age, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ sleeps_with_human, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ vacc_status, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ worm_status, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ hist_of_vom, data = risk_dat3, binomial(link = "logit"))) #**
+summary(glm(any_vom ~ neutering_status, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ household_smoking_status, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ cats_household, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ dogs_household, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ insurance_status, data = risk_dat3, binomial(link = "logit"))) #**
+summary(glm(any_vom ~ household_type, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ area_class, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ UK_region, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ dog_has_occupation, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ exercise_quantity, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ food_quantity, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ diet_wet_food, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ diet_raw_food, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ titbits, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ weight, data = risk_dat3, binomial(link = "logit"))) #**
+summary(glm(any_vom ~ feeding_frequency, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ bathed_since_last_visit, data = risk_dat3, binomial(link = "logit"))) #**
+summary(glm(any_vom ~ anti_parasitic_since_last_visit, data = risk_dat3, binomial(link = "logit")))
+summary(glm(any_vom ~ travelled_abroad_since_last_visit, data = risk_dat3, binomial(link = "logit")))
+#nothing new
+  
+#Final model is everything in stepwise selection plus age
+rm_final <- glm(any_vom ~ weight + insurance_status + worm_status + 
+    hist_of_vom + titbits + food_quantity + bathed_since_last_visit + 
+    travelled_abroad_since_last_visit + age, data = risk_dat3, family=binomial(link = "logit"))
+
+summary(rm_final)
+
+#odds ratios
+exp(rm_final$coefficients)
+#CIs
+exp(confint(rm_final))
+
+ #CHECK FOR INFLUENTIAL OBSERVATIONS
+  augment(rm_final) %>% 
+    filter(abs(.std.resid) > 3) #No values are influential - check again after model fitting
+  
+   #CHECK FOR COLINEARITY
+ #check for colinearity and influential values/data points
+  vif2 <-car::vif(rm_final) 
+  
+  vif2 #no colinearity
+  
+  #CHECK FOR PERFECT SEPARATION #there is no perfect seperation in any variable
+  
+  #roc analysis of final model
+  risk_dat3$predictions <- predict(rm_final)
+
+pROC_risk <- pROC::roc(risk_dat3$any_vom, risk_dat3$predictions,
+    smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE, percent = TRUE )
+```
+
+
+Model output from vet visit
+
+```{r, echo=TRUE}
+#P values:
+summary(rm_final)$coefficients[,4]
+
+#Odds ratios:
+exp(rm_final$coefficients)
+
+#Confidence intervals:
+exp(confint(rm_final))
+
+#AUC:
+pROC_risk$auc
+pROC_risk$ci
+```
+
+
+### PLOT THE MODEL OUTPUT from vet visit
+```{r}
+risk1 <- tibble(Variable = names(exp(confint(rm_final))[,1]),
+               OR = exp(rm_final$coefficients),
+               lower95ci = exp(confint(rm_final))[,1],
+               upper95ci = exp(confint(rm_final))[,2],
+               `Pr(>|Z|)` = summary(rm_final)$coefficients[,4]) %>%
+  mutate_at(vars(OR, lower95ci, upper95ci, `Pr(>|Z|)`), ~ round(., 3)) %>%
+   mutate(`Pr(>|Z|)` = case_when(Variable == "hist_of_vomyes" ~ "< 0.001",
+                                TRUE ~ as.character(`Pr(>|Z|)`))) %>%
+  arrange(Variable) %>%
+  filter(Variable != "(Intercept)")
+
+categories <- tibble(Variable2 = c("Age (Years)",
+                                  "Dog has been bathed since last visit to Dogslife",
+                                   NA_character_,
+                                  "Quantity of food (Kg)",
+                                  "Dog has vomited within the last 4 months",
+                                   NA_character_,
+                                  "Insurance status",
+                                   NA_character_,
+                                  "Dog is fed titbits",
+                                  NA_character_,
+                                  "Dog has travelled aboad since last visit to Dogslife",
+                                   NA_character_,
+                                  "Weight (Kg)",
+                                  "Dog has been wormed in the last 9 months",
+                                   NA_character_),
+                     Category = c(NA_character_,
+                                  "No",
+                                  "Yes",
+                                  NA_character_,
+                                  "No",
+                                  "Yes",
+                                  "No",
+                                  "Yes",
+                                  "No",
+                                  "Yes",
+                                  "No",
+                                  "Yes",
+                                  NA_character_,
+                                  "No",
+                                  "Yes"),
+                     Variable = c("age",
+                                  "bathed_since_last_visityes",
+                                  "bathed_since_last_visityes",
+                                  "food_quantity",
+                                  "hist_of_vomyes",
+                                  "hist_of_vomyes",
+                                  "insurance_statusyes" ,
+                                  "insurance_statusyes" ,
+                                  "titbitsyes",
+                                  "titbitsyes",
+                                  "travelled_abroad_since_last_visityes",
+                                  "travelled_abroad_since_last_visityes",
+                                  "weight",
+                                  "worm_statuswithin 9m",
+                                  "worm_statuswithin 9m"))
+
+risk1 <- full_join(risk1, categories) %>%
+  mutate_at(vars(lower95ci, upper95ci, OR), ~ case_when(Category == "No" ~ NA_real_,
+                                                                    TRUE ~ .))
+ 
+risk_text <- risk1 %>%
+  mutate_all(~ as.character(.)) %>%
+        mutate(lower95ci = case_when(lower95ci == "1" ~ "1.",
+                                     TRUE ~ lower95ci),
+               lower95ci = paste(lower95ci, "000", ""),
+               lower95ci = substr(str_replace_all(lower95ci, " ", ""), start = 1, stop = 5),
+               upper95ci = paste(upper95ci, "000", ""),
+               upper95ci = substr(str_replace_all(upper95ci, " ", ""), start = 1, stop = 5),
+               OR = paste(OR, "000", ""),
+              OR = substr(str_replace_all(OR, " ", ""), start = 1, stop = 5)) %>%
+  select(Variable = Variable2, Category, OR, lower95ci, upper95ci, `Pr(>|Z|)`) %>%
+  mutate_at(vars(lower95ci, upper95ci, `Pr(>|Z|)`, OR), ~ case_when(Category == "No" ~ NA_character_,
+                                                                    TRUE ~ .))
+
+text_labels <- tibble(Variable = c("Variable"), 
+                      Category = c("Category"), 
+                      OR = c("Odds ratio"),
+                      lower95ci = c("Lower 95% CI"),
+                      upper95ci = c("Upper 95% CI"),
+                      `Pr(>|Z|)` = c("P-value"))
+
+risk_text <- rbind(text_labels, risk_text)
+
+risk_nums <- risk1 %>%
+  select(OR, lower95ci, upper95ci) %>%
+        mutate_all(as.numeric) %>%
+  mutate_at(vars(OR), ~ case_when(is.na(.) == TRUE ~ 0,
+                                                                    TRUE ~ .))
+
+num_labels <- tibble(OR = c(NA), 
+                      lower95ci = c(NA), 
+                      upper95ci = c(NA))
+
+risk_nums <- rbind(num_labels, risk_nums)
+
+#Plot and save the forestplot
+fplot1 <- forestplot(risk_text, 
+                         risk_nums,
+                         align = "c",
+                         boxsize = 0.2,
+                         graphwidth = unit(14, "cm"),
+                         new_page = TRUE,
+                         colgap = unit(4, "mm"),
+                         is.summary = c(TRUE, rep(FALSE, 15)),
+                         lwd.ci=1.5,
+                         lwd.zero = 1.5,
+                         ci.vertices = TRUE,
+                         zero = 1,
+                         graph.pos = 4,
+                    txt_gp=fpTxtGp(label=gpar(cex=1.5),
+                                        ticks=gpar(cex=1.5),
+                                        xlab=gpar(cex=1.5)),
+                         hrzl_lines = list("2" = gpar(col="#444444"),
+                                           "17" = gpar(col="#444444")),
+                         col = fpColors(lines="blue", box="darkblue", zero = "red"))
+fplot1
+
+ggsave(filename = "Figure6.tiff",
+       plot = forestplot(risk_text, 
+                         risk_nums,
+                         align = "c",
+                         boxsize = 0.2,
+                         graphwidth = unit(14, "cm"),
+                         new_page = TRUE,
+                         colgap = unit(4, "mm"),
+                         is.summary = c(TRUE, rep(FALSE, 15)),
+                         lwd.ci=1.5,
+                         lwd.zero = 1.5,
+                         ci.vertices = TRUE,
+                         zero = 1,
+                         graph.pos = 4,
+                    txt_gp=fpTxtGp(label=gpar(cex=1.5),
+                                        ticks=gpar(cex=1.5),
+                                        xlab=gpar(cex=1.5)),
+                         hrzl_lines = list("2" = gpar(col="#444444"),
+                                           "17" = gpar(col="#444444")),
+                         col = fpColors(lines="blue", box="darkblue", zero = "red")),
+       width = 600, height = 300, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+
+```
+
+
